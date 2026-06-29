@@ -4,7 +4,7 @@
 
 ## Summary
 
-Plan a **Windows-only** localhost image generator that runs startup preflight checks, detects NVIDIA GPU VRAM, filters compatible text-to-image models, lets users choose or import models, edit prompt templates, save prompts to a personal library, and generate multiple images sequentially on 8GB-class GPUs—with full job history across app restarts.
+Plan a **Windows-only** localhost image generator that runs startup preflight checks, detects NVIDIA GPU VRAM, filters compatible models, lets users choose a model from a **dropdown**, refresh manually added models on demand, edit prompt templates, save prompts to a personal library, and generate multiple images sequentially on 8GB-class GPUs—with full job history across app restarts.
 
 ## Design Decisions
 
@@ -16,12 +16,15 @@ Plan a **Windows-only** localhost image generator that runs startup preflight ch
 | App launcher | **`start.bat`** at **project root**; starts backend in **background**; launcher exits after browser opens |
 | Platform | **Windows only** (Windows 10/11); no Linux or macOS support in v1 |
 | GPU target | NVIDIA CUDA on Windows |
-| Model management | Curated in-app catalog with downloads **and** local model import |
+| Model management | Curated catalog + manually added local models; user chooses from **dropdown** |
+| Model selection UI | **Dropdown** on Generate page — one list for catalog and local models |
+| App-added models | **Auto-detected** when catalog download completes (no folder scan) |
+| User-added models | **Refresh** button runs folder scan; no auto-scan on startup or dropdown open |
 | Generation scope (v1) | Text-to-image only |
 | Multi-image behavior | Queue sequentially with progress; safest for 8GB VRAM |
 | Initial model catalog | **2–3 SD 1.5** models + **1 SDXL** in curated catalog (expand after 8GB tuning) |
-| Model storage | Single directory: `%APPDATA%/OnPremImageGenerator/models`; lazy download on model select |
-| Pipeline loading | Lazy load on first generate; cache in memory until model changes |
+| Model storage | Single directory: `%APPDATA%/OnPremImageGenerator/models`; lazy download when user picks a catalog entry |
+| Pipeline loading | Lazy load on **Generate** only; cache in memory until model changes |
 | Progress updates | Server-Sent Events (SSE) for live job progress and image-complete events |
 | Gallery thumbnails | 256px cached thumbs; full PNG only on preview/download |
 | Default generation | DPM++ 2M scheduler, **25 steps** default |
@@ -88,7 +91,7 @@ flowchart LR
 - `backend/app/main.py` — FastAPI app and route registration
 - `backend/app/services/gpu.py` — detect CUDA availability, GPU name, total VRAM, free VRAM, driver/runtime info
 - `backend/app/services/preflight.py` — dependency and environment checks; returns pass/warn/fail with fix hints
-- `backend/app/services/models.py` — curated catalog, local import scanning, VRAM compatibility filtering
+- `backend/app/services/models.py` — catalog, cached local model list, folder scan on refresh, VRAM filtering, dropdown list API
 - `backend/app/services/generation.py` — Diffusers pipeline cache, lazy load, memory-safe generation, sequential queue, PNG + thumb writes
 - `backend/app/services/worker.py` — dedicated generation worker process; thread-safe queue; posts progress to SSE bus
 - `backend/app/services/downloads.py` — model download with resume and checksum verification
@@ -105,8 +108,7 @@ flowchart LR
 - `config/settings.json` — persisted user settings (created on first run; gitignored)
 - `data/app.db` — SQLite database for prompt library and job history (gitignored)
 - `frontend/src/App.tsx` — main UI shell
-- `frontend/src/features/models` — model picker and compatibility messaging
-- `frontend/src/features/generate` — prompt editor, settings panel, queue progress, and gallery
+- `frontend/src/features/generate` — prompt editor, **model dropdown**, settings panel, queue progress, and gallery
 - `frontend/src/features/prompts` — saved prompt library browser, search, favorites
 - `frontend/src/features/history` — job history list, job detail, re-run settings
 - `frontend/src/features/settings` — output directory, history retention, and **System status** (preflight results)
@@ -116,13 +118,13 @@ flowchart LR
 
 Use Hugging Face Diffusers as the first generation runtime. This keeps the app under our control, avoids depending on another web UI, and gives direct access to memory options like `torch_dtype=torch.float16`, attention slicing, and VAE tiling.
 
-**Do not load a Diffusers pipeline on app startup.** Detect GPU, load settings, and init SQLite first so the UI appears quickly. Load the pipeline lazily on the first generate request (or when the user selects a model to preload), then **keep it cached in memory until the selected model changes** to avoid repeated 10–30s reloads.
+**Do not load a Diffusers pipeline on app startup.** Detect GPU, load settings, and init SQLite first so the UI appears quickly. Load the pipeline **only when the user clicks Generate** with the selected model, then **keep it cached in memory until the model changes**. Selecting a model in the dropdown does **not** load it into GPU memory.
 
 Detect NVIDIA VRAM at startup using PyTorch CUDA APIs, with `nvidia-smi` as a diagnostic fallback. Store both total VRAM and current free VRAM, but filter the model list primarily by total VRAM with a conservative reserved headroom. This avoids hiding models just because another process is temporarily using the GPU, while still warning if free VRAM is currently too low.
 
-All downloaded and imported models live under **`%APPDATA%/OnPremImageGenerator/models`**. Download a model only when the user selects it from the catalog (lazy download). Support **resume and checksum verification** for large model files.
+All downloaded and manually added models live under **`%APPDATA%/OnPremImageGenerator/models`**. **App-downloaded** catalog models are registered in the dropdown automatically when download completes. **User-copied** models are not scanned automatically — the user clicks **Refresh** next to the model dropdown to discover new files (saves disk I/O and CPU). On startup, restore the **last cached local model list** without walking the folder. Support **resume and checksum verification** for catalog downloads.
 
-Model compatibility should be based on model plus safe preset. Each catalog entry should include fields such as `family`, `min_vram_gb`, `recommended_vram_gb`, `default_width`, `default_height`, `default_steps`, `precision`, and `requires_license_acceptance`. Imported local models can be shown as "unknown compatibility" until the user assigns a family or the app infers metadata from the model structure.
+Model compatibility should be based on model plus safe preset. Each catalog entry should include fields such as `family`, `min_vram_gb`, `recommended_vram_gb`, `default_width`, `default_height`, `default_steps`, `precision`, and `requires_license_acceptance`. Manually added local models appear in the dropdown with inferred or **unknown** compatibility until the app detects family from folder structure (Diffusers layout or `.safetensors` checkpoint).
 
 Image size is part of the safe preset, not a separate free-form setting in v1. See [Image Size / Resolution](#image-size--resolution) below.
 
@@ -130,9 +132,11 @@ Generate multiple requested images sequentially through a queue, executed in a *
 
 ## Version 1 UX
 
-The model picker shows only compatible curated models by default. A secondary "Imported / Unknown" area can show local models with clear compatibility status, but the main recommended flow should only offer models that match the detected GPU VRAM.
+On the **Generate** page, the user picks a model from a **dropdown**. Next to the dropdown, a **Refresh** button rescans the models folder for manually added files. Catalog models downloaded by the app appear automatically without Refresh. Incompatible models for the detected GPU are shown **disabled** with a short reason.
 
-The prompt flow should start from bundled editable templates **or** a saved entry from the user's prompt library. A user chooses a starting point, edits the final prompt and optional negative prompt, then chooses image count, dimensions from safe presets, steps, and seed behavior. They can save the current prompt to the library at any time before generating. Generated images are saved to the user's configured output directory, recorded in job history, and shown in the in-app gallery.
+Choosing a model in the dropdown **only updates the form** — it does not load weights into GPU memory. The user decides whether to use that model by selecting it and clicking **Generate**.
+
+The prompt flow should start from bundled editable templates **or** a saved entry from the user's prompt library. A user chooses a starting point, edits the final prompt and optional negative prompt, then chooses **model (dropdown)**, image count, dimensions from safe presets, steps, and seed behavior. They can save the current prompt to the library at any time before generating. Generated images are saved to the user's configured output directory, recorded in job history, and shown in the in-app gallery.
 
 The generation screen should show queue progress via **SSE** with **per-step progress** (e.g. step 12/25) and per-image status, cached **256px WebP thumbnails**, seed/model/settings metadata, and error messages for out-of-memory failures with a suggested lower-memory preset. Clicking a thumbnail opens a full-size preview; each image can be downloaded or opened in the file manager.
 
@@ -220,6 +224,90 @@ Extend `models.catalog.json` entries with a `size_presets` array:
 ```
 
 Backend service `models.py` should expose a helper such as `get_compatible_presets(model_id, total_vram_gb)` used by both the model list and generate endpoints.
+
+## Model Selection & Local Discovery
+
+Two paths for models in the dropdown — app-added vs user-added:
+
+| Source | How it gets into dropdown | User action |
+|--------|---------------------------|-------------|
+| **Catalog download** (app-added) | Registered automatically when download completes | Select from dropdown → Generate |
+| **Manual copy** (user-added) | Appears after user clicks **Refresh** | Copy files → **Refresh** → select → Generate |
+
+### Models folder
+
+- Path: `%APPDATA%/OnPremImageGenerator/models/`
+- User can copy models manually (Diffusers folder or `.safetensors` checkpoint)
+- No import wizard in v1
+
+### Discovery rules (resource-friendly)
+
+| Event | Behavior |
+|-------|----------|
+| Backend startup | Load **cached** local model list from disk/SQLite — **no folder walk** |
+| Catalog download completes | Add/update that catalog entry in dropdown immediately — **no full folder scan** |
+| User clicks **Refresh** | Walk models folder; update local entries; save cache |
+| Dropdown opened | **No scan** — use cached list only |
+
+Supported layouts (scan on Refresh only):
+
+- **Diffusers folder** — contains `model_index.json`
+- **Single checkpoint** — `.safetensors` file (infer SD 1.5 vs SDXL from filename/metadata when possible)
+
+Do **not** load model weights during scan — filesystem inspection only.
+
+### Dropdown UI (Generate page)
+
+Single **Model** dropdown with a **Refresh** button beside it:
+
+```
+[ Model ▼ Realistic Vision (SD 1.5)    ]  [ Refresh ]
+
+── Catalog ──
+  Realistic Vision (SD 1.5)          Ready
+  SDXL Base                          Download
+── Local (manual) ──
+  my-custom-model                      ⚠ unknown VRAM
+```
+
+- **Catalog** entries: from `models.catalog.json`; app download → auto “Ready”
+- **Local (manual)** entries: from last Refresh scan; label = folder or file name
+- **Refresh** tooltip: “Scan models folder for manually added models”
+- Compatible models: selectable; incompatible: **disabled** with tooltip
+- Unknown local models: selectable with warning; conservative SD 1.5 presets by default
+
+No preload on selection. Pipeline loads when user clicks **Generate**.
+
+### API
+
+| Method | Endpoint | Purpose |
+|--------|----------|---------|
+| GET | `/api/models` | Return cached dropdown list (catalog + local); **no scan** |
+| POST | `/api/models/refresh` | Scan models folder for user-added models; update cache; return updated list |
+| POST | `/api/models/{id}/download` | Download a catalog model; on complete, auto-add to list |
+
+`GET /api/models` response shape (per item): `id`, `label`, `source` (`catalog` \| `local`), `status` (`ready` \| `download` \| `unknown`), `compatible`, `family`, `disabled_reason`.
+
+### User flows
+
+**App-downloaded model:**
+
+```mermaid
+flowchart LR
+  Select[User picks catalog model] --> Download[App downloads]
+  Download --> AutoAdd[Auto-added to dropdown]
+  AutoAdd --> Generate[User clicks Generate]
+```
+
+**User-copied model:**
+
+```mermaid
+flowchart LR
+  Drop[User copies model to folder] --> Refresh[User clicks Refresh]
+  Refresh --> Dropdown[Model appears in dropdown]
+  Dropdown --> Select[User selects model]
+  Select --> Generate[User clicks Generate]
+```
 
 ## Output Directory & Settings
 
@@ -754,7 +842,7 @@ Each check returns: `id`, `name`, `status` (`pass` \| `warn` \| `fail`), `messag
 
 **Not** included as global startup blockers (handled elsewhere):
 
-- **Model not downloaded** — shown on model picker as “Download required”, not a preflight fail
+- **Model not downloaded** — catalog entry shows “Download” in dropdown; optional inline download action before Generate
 - **Selected model incompatible with VRAM** — handled by model/size preset filtering
 
 ### API
@@ -852,7 +940,7 @@ Build in this order to validate the hardest path early and reduce rework:
 3. **One SD 1.5 model**: lazy pipeline load, generate one image, save PNG + `job.json`, SSE progress, 256px thumbs
 4. Sequential multi-image queue, job history persistence, in-app gallery, cancellation, interrupted-job recovery
 5. Bundled prompt templates, saved prompt library (CRUD, search, favorites), and History page with re-run
-6. Model lazy download (resume + checksum), local model import scanning, SDXL with memory opts + OOM handling
+6. Model lazy download (resume + checksum, auto-add to dropdown), Refresh-based local scan, SDXL memory opts + OOM handling
 7. Job history retention pruning; log retention pruning (30 days); full verification on Windows 10/11 with 8GB NVIDIA GPU
 
 ## Build Checklist
@@ -860,7 +948,7 @@ Build in this order to validate the hardest path early and reduce rework:
 - [ ] Create FastAPI + React scaffold; bind `127.0.0.1:8000`; `/api/health`; SQLite init; root **`start.bat`** (background + browser) and **`stop.bat`**
 - [ ] Implement preflight service, `/api/system/preflight`, Setup banner, and Settings → System status UI
 - [ ] Implement CUDA GPU detection and expose VRAM/runtime information to the UI
-- [ ] Build curated catalog (2–3 SD 1.5 + 1 SDXL), size presets, local import scanner, VRAM filter
+- [ ] Build curated catalog (2–3 SD 1.5 + 1 SDXL), model dropdown + Refresh button, cached local list, VRAM filter
 - [ ] Add Settings, output directory validation, lazy model download with resume + checksum
 - [ ] Implement lazy pipeline cache, model warmup, SDPA attention, TF32/cuDNN flags, one SD 1.5 image generation, PNG + `job.json`, 256px WebP thumbs
 - [ ] Add generation worker process; SSE per-step progress; prompt-encode-once; async file/thumb writes
@@ -881,7 +969,10 @@ Test on **Windows 10/11** with an NVIDIA CUDA GPU (8GB VRAM). Verify:
 - Preflight checks report missing CUDA, driver, GPU, or writable paths with fix hints
 - Generate blocked when critical preflight checks fail; warnings shown for low VRAM/disk
 - Settings → System status re-runs checks on demand
-- Compatible model filtering (model + size preset)
+- Compatible model filtering (model + size preset); incompatible models disabled in dropdown
+- Catalog download auto-adds model to dropdown without folder scan
+- User-copied models appear only after **Refresh**; no scan on startup or dropdown open
+- Model selection via dropdown; pipeline loads on Generate, not on dropdown change
 - Size preset picker shows only VRAM-safe options; unsupported sizes are disabled
 - OOM recovery suggests the next smaller preset
 - SD 1.5 generation
@@ -916,6 +1007,6 @@ Test on **Windows 10/11** with an NVIDIA CUDA GPU (8GB VRAM). Verify:
 - Interrupted jobs marked correctly after app crash or close
 - **Use again** from History prefills the generate form
 - Prompt template editing (bundled templates + library)
-- Local model import
+- Local models: copy to models folder → click **Refresh** → selectable in dropdown
 - Offline generation after model download
 - Graceful recovery from an intentional out-of-memory setting

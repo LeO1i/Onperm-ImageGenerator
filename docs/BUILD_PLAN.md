@@ -25,6 +25,16 @@ Plan a **Windows-only** localhost image generator that runs startup preflight ch
 | Progress updates | Server-Sent Events (SSE) for live job progress and image-complete events |
 | Gallery thumbnails | 256px cached thumbs; full PNG only on preview/download |
 | Default generation | DPM++ 2M scheduler, **25 steps** default |
+| Generation runtime | Diffusers runs in a **separate worker process**; FastAPI stays responsive |
+| Attention backend | **SDPA** (PyTorch 2.x) preferred; xFormers fallback; attention slicing last resort |
+| Prompt encoding | Encode prompt + negative prompt **once per job**, reuse for all images |
+| Model warmup | Run 1-step dummy generation after pipeline load |
+| GPU speedups | TF32 + `cudnn.benchmark` on Ampere/Ada GPUs; `torch.inference_mode()` |
+| Progress granularity | SSE emits **per-step** progress, not only per-image |
+| File writes | PNG save + thumbnail generation run on a **background thread pool** |
+| SQLite mode | WAL + `synchronous=NORMAL` for non-blocking reads |
+| Static assets | Long `Cache-Control` + gzip/brotli for built React files |
+| Frontend loading | Code-split History and Settings pages (lazy load) |
 | Network binding | Backend binds to `127.0.0.1:8000` only (local-only, not LAN) |
 | Job history retention | Keep last **500 jobs** or **90 days** (configurable in Settings) |
 | Log retention | Auto-delete log files older than **30 days** (configurable in Settings) |
@@ -80,8 +90,9 @@ flowchart LR
 - `backend/app/services/preflight.py` — dependency and environment checks; returns pass/warn/fail with fix hints
 - `backend/app/services/models.py` — curated catalog, local import scanning, VRAM compatibility filtering
 - `backend/app/services/generation.py` — Diffusers pipeline cache, lazy load, memory-safe generation, sequential queue, PNG + thumb writes
+- `backend/app/services/worker.py` — dedicated generation worker process; thread-safe queue; posts progress to SSE bus
 - `backend/app/services/downloads.py` — model download with resume and checksum verification
-- `backend/app/services/thumbnails.py` — generate and serve 256px thumbnail cache
+- `backend/app/services/thumbnails.py` — generate and serve 256px thumbnail cache (WebP format, background thread)
 - `backend/app/services/prompts.py` — bundled prompt templates and saved prompt library CRUD
 - `backend/app/services/jobs.py` — job history persistence, retention, status updates, re-run helpers, SSE events
 - `backend/app/services/settings.py` — load/save persistent user settings, validate output directory
@@ -115,7 +126,7 @@ Model compatibility should be based on model plus safe preset. Each catalog entr
 
 Image size is part of the safe preset, not a separate free-form setting in v1. See [Image Size / Resolution](#image-size--resolution) below.
 
-Generate multiple requested images sequentially through a queue. Use a **seed stream** for multi-image jobs: base seed for image 1, then `seed + 1`, `seed + 2`, etc. Call `torch.cuda.empty_cache()` between images **only when needed** (after OOM or when switching models), not unconditionally. Push progress to the UI via **SSE** (`image_completed`, `progress`, `failed`). Each job is written to SQLite so history survives app restarts. Re-validate [preflight checks](#dependency--preflight-checks) before enqueueing a job. See [Storage & Database](#storage--database), [Saved Prompt Library](#saved-prompt-library), [Job History](#job-history), and [Runtime & Performance](#runtime--performance).
+Generate multiple requested images sequentially through a queue, executed in a **dedicated worker process** so the FastAPI event loop never blocks during inference. Use a **seed stream** for multi-image jobs: base seed for image 1, then `seed + 1`, `seed + 2`, etc. **Encode the prompt and negative prompt once per job** and reuse the embeddings for all N images (only the seed changes). Call `torch.cuda.empty_cache()` between images **only when needed** (after OOM or when switching models), not unconditionally. Push **per-step** progress to the UI via **SSE** (`step`, `progress`, `image_completed`, `failed`). Each job is written to SQLite so history survives app restarts. Re-validate [preflight checks](#dependency--preflight-checks) before enqueueing a job. See [Storage & Database](#storage--database), [Saved Prompt Library](#saved-prompt-library), [Job History](#job-history), and [Runtime & Performance](#runtime--performance).
 
 ## Version 1 UX
 
@@ -123,7 +134,7 @@ The model picker shows only compatible curated models by default. A secondary "I
 
 The prompt flow should start from bundled editable templates **or** a saved entry from the user's prompt library. A user chooses a starting point, edits the final prompt and optional negative prompt, then chooses image count, dimensions from safe presets, steps, and seed behavior. They can save the current prompt to the library at any time before generating. Generated images are saved to the user's configured output directory, recorded in job history, and shown in the in-app gallery.
 
-The generation screen should show queue progress via **SSE** (live updates as each image completes), per-image status, cached **256px thumbnails**, seed/model/settings metadata, and error messages for out-of-memory failures with a suggested lower-memory preset. Clicking a thumbnail opens a full-size preview; each image can be downloaded or opened in the file manager.
+The generation screen should show queue progress via **SSE** with **per-step progress** (e.g. step 12/25) and per-image status, cached **256px WebP thumbnails**, seed/model/settings metadata, and error messages for out-of-memory failures with a suggested lower-memory preset. Clicking a thumbnail opens a full-size preview; each image can be downloaded or opened in the file manager.
 
 A **History** page lists past generation jobs (newest first) with status, thumbnail strip, and a **Use again** action that prefills the generate form with that job's settings.
 
@@ -509,7 +520,7 @@ Each output image gets a `job_images` row:
 | POST | `/api/jobs/{id}/cancel` | Cancel a running or queued job |
 | DELETE | `/api/jobs/{id}` | Delete job record (optional `?delete_files=true`) |
 | GET | `/api/jobs/recent-images` | Recent completed images for gallery strip |
-| GET | `/api/jobs/{id}/events` | SSE stream for job progress (`progress`, `image_completed`, `failed`, `done`) |
+| GET | `/api/jobs/{id}/events` | SSE stream for job progress (`step`, `progress`, `image_completed`, `failed`, `done`) |
 
 ### SQLite schema (jobs)
 
@@ -628,7 +639,26 @@ Backend logs go to `%APPDATA%/OnPremImageGenerator/logs/` (e.g. `app.log` with d
 - Load pipeline **lazily** on first generate (show "Loading model…" in UI).
 - Keep the loaded pipeline in memory while the same model remains selected.
 - **Reload only when `model_id` changes**; unload previous pipeline before loading the next.
-- For SDXL, enable at load time: **fp16**, **attention slicing**, **VAE tiling**.
+- For SDXL, enable at load time: **fp16**, **VAE tiling**.
+- **Attention backend (in priority order):** PyTorch 2.x **SDPA** → xFormers → attention slicing (last resort).
+- **Model warmup:** after load, run a 1-step dummy generation so the first real image isn't penalized by CUDA kernel autotuning / lazy init.
+
+### Generation worker
+
+- Run the generation queue in a **dedicated worker process** (or thread with `asyncio.to_thread`) so FastAPI stays responsive — SSE, Settings, History, and `/api/health` must not stall during inference.
+- Communication: thread-safe job queue in → progress bus out (SSE consumes the bus).
+- Cancellation flag checked **per step**, so cancel is responsive even mid-inference.
+
+### GPU speedups
+
+- Wrap inference in `torch.inference_mode()`.
+- On Ampere/Ada GPUs (RTX 30/40 series): enable **TF32** (`torch.backends.cuda.matmul.allow_tf32 = True`) and **`torch.backends.cudnn.benchmark = True`** for free speedup with negligible quality impact.
+- Detect GPU compute capability in `gpu.py` and apply these only when supported.
+
+### Prompt encoding optimization
+
+- For multi-image jobs, run CLIP text encoding of `prompt` and `negative_prompt` **once**, then reuse `prompt_embeds` / `negative_prompt_embeds` for every image in the job (only the seed changes).
+- Avoids N redundant encoding passes per job.
 
 ### Generation defaults
 
@@ -638,17 +668,28 @@ Backend logs go to `%APPDATA%/OnPremImageGenerator/logs/` (e.g. `app.log` with d
 | Steps | 25 | Exposed in UI; user can adjust |
 | Multi-image seeds | `seed`, `seed+1`, `seed+2`, … | Predictable batch variation |
 
+### File writes & thumbnails
+
+- After each image, hand off PNG save + thumbnail generation to a **background thread pool** so the GPU can start the next image immediately.
+- Thumbnails are **WebP** at 256px (faster encode, smaller files than PNG; quality irrelevant at preview size).
+- Store thumbs under `%APPDATA%/OnPremImageGenerator/thumbs/{job_id}/`.
+
 ### Model downloads
 
 - Store all models under `%APPDATA%/OnPremImageGenerator/models/`.
+- Prefer **safetensors** format when available (faster load, safer than pickle).
 - **Lazy download**: fetch only when user selects a catalog model that is not yet local.
 - Support **resume** on interrupted downloads and **checksum verification** after complete.
 
-### Thumbnails
+### SQLite performance
 
-- On each saved PNG, generate a **256px** thumbnail (Pillow) immediately after generation.
-- Store under `%APPDATA%/OnPremImageGenerator/thumbs/{job_id}/`.
-- Gallery and History list views serve thumbs; full PNG only for preview/download.
+- Enable **WAL mode** (`PRAGMA journal_mode=WAL`) and `PRAGMA synchronous=NORMAL` so History/gallery reads don't block job writes during generation.
+- Use a single shared connection with thread-safe access (or a small connection pool).
+
+### Static assets & frontend loading
+
+- FastAPI serves built React files with long `Cache-Control` for hashed assets and **gzip/brotli** compression.
+- **Code-split** the History and Settings pages (React.lazy) so the initial Generate page loads faster.
 
 ### Job history retention
 
@@ -787,12 +828,18 @@ Prioritize SD 1.5 models as the reliable baseline. Include SDXL only with conser
 
 Use safeguards in generation:
 
+- Run generation in a dedicated worker; FastAPI stays responsive
 - Lazy-load and cache only the selected model pipeline; reload when model changes
-- Use fp16 on CUDA; enable attention slicing and VAE tiling for SDXL at load time
+- Warm up pipeline with a 1-step dummy run after load
+- Use fp16 on CUDA; enable **SDPA** (or xFormers / slicing fallback) and VAE tiling for SDXL at load time
+- Enable TF32 + cuDNN benchmark on Ampere/Ada GPUs
+- Encode prompt + negative prompt once per job; reuse embeddings for all images
+- Wrap inference in `torch.inference_mode()`
 - Limit dimensions to curated size presets per model family (see Image Size / Resolution)
 - Filter visible presets by detected VRAM before generation
 - Generate images sequentially even when the user requests multiple outputs
 - Use seed stream (`seed + n`) for multi-image jobs
+- Offload PNG save + thumbnail generation to a background thread pool
 - Call `torch.cuda.empty_cache()` only when needed (OOM recovery or model swap)
 - Catch CUDA out-of-memory errors, release memory, and return actionable UI guidance
 
@@ -815,8 +862,10 @@ Build in this order to validate the hardest path early and reduce rework:
 - [ ] Implement CUDA GPU detection and expose VRAM/runtime information to the UI
 - [ ] Build curated catalog (2–3 SD 1.5 + 1 SDXL), size presets, local import scanner, VRAM filter
 - [ ] Add Settings, output directory validation, lazy model download with resume + checksum
-- [ ] Implement lazy pipeline cache, one SD 1.5 image generation, PNG + `job.json`, 256px thumbs
+- [ ] Implement lazy pipeline cache, model warmup, SDPA attention, TF32/cuDNN flags, one SD 1.5 image generation, PNG + `job.json`, 256px WebP thumbs
+- [ ] Add generation worker process; SSE per-step progress; prompt-encode-once; async file/thumb writes
 - [ ] Add SSE job progress stream; sequential multi-image queue; cancellation; in-app gallery
+- [ ] Enable SQLite WAL mode; static asset caching + gzip; frontend code splitting
 - [ ] Implement job history, History page with re-run, retention pruning (90 days / 500 jobs)
 - [ ] Implement log retention: auto-delete log files older than 30 days on startup and daily
 - [ ] Implement bundled templates and saved prompt library (CRUD, search, favorites)
@@ -850,6 +899,14 @@ Test on **Windows 10/11** with an NVIDIA CUDA GPU (8GB VRAM). Verify:
 - Job retention prunes jobs beyond 90 days or 500-job cap
 - Log files older than 30 days are auto-deleted; `log_retention_days` configurable in Settings
 - Default scheduler DPM++ 2M at 25 steps; multi-image seed stream
+- Generation runs in a dedicated worker; FastAPI/SSE/Settings stay responsive during inference
+- Prompt + negative prompt encoded once per job and reused for all images
+- SDPA attention (or xFormers / slicing fallback) enabled; model warmed up with a 1-step dummy run
+- TF32 + cuDNN benchmark on Ampere/Ada GPUs; inference under `torch.inference_mode()`
+- SSE emits per-step progress (e.g. step 12/25), not only per-image completion
+- PNG save + WebP thumbnail generation run on a background thread pool
+- SQLite WAL mode enabled; reads don't block writes during generation
+- Static assets served with long cache headers + gzip; History/Settings pages code-split
 - Custom output directory can be set in Settings and persists across app restarts
 - Invalid or unwritable output paths are rejected with clear UI errors
 - Generated files appear on disk under `{job_id}/` folders with `job.json` metadata

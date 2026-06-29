@@ -4,18 +4,30 @@
 
 ## Summary
 
-Plan a localhost image generator that detects NVIDIA GPU VRAM, filters compatible text-to-image models, lets users choose or import models, edit prompt templates, save prompts to a personal library, and generate multiple images sequentially on 8GB-class GPUs—with full job history across app restarts.
+Plan a **Windows-only** localhost image generator that runs startup preflight checks, detects NVIDIA GPU VRAM, filters compatible text-to-image models, lets users choose or import models, edit prompt templates, save prompts to a personal library, and generate multiple images sequentially on 8GB-class GPUs—with full job history across app restarts.
 
 ## Design Decisions
 
 | Area | Decision |
 |------|----------|
-| App shell | Local web app: Python backend + browser UI at localhost |
-| GPU target | NVIDIA CUDA on Windows/Linux first |
+| App shell | Local web app: Python backend + browser UI at `http://127.0.0.1:8000` |
+| App URL / port | **`http://127.0.0.1:8000`** — fixed port **8000** in v1 |
+| Browser launch | Auto-open default browser via root `start.bat` after backend health check passes |
+| App launcher | **`start.bat`** at **project root**; starts backend in **background**; launcher exits after browser opens |
+| Platform | **Windows only** (Windows 10/11); no Linux or macOS support in v1 |
+| GPU target | NVIDIA CUDA on Windows |
 | Model management | Curated in-app catalog with downloads **and** local model import |
 | Generation scope (v1) | Text-to-image only |
 | Multi-image behavior | Queue sequentially with progress; safest for 8GB VRAM |
-| Initial model catalog | Stable Diffusion 1.5 + selected 8GB-friendly SDXL models |
+| Initial model catalog | **2–3 SD 1.5** models + **1 SDXL** in curated catalog (expand after 8GB tuning) |
+| Model storage | Single directory: `%APPDATA%/OnPremImageGenerator/models`; lazy download on model select |
+| Pipeline loading | Lazy load on first generate; cache in memory until model changes |
+| Progress updates | Server-Sent Events (SSE) for live job progress and image-complete events |
+| Gallery thumbnails | 256px cached thumbs; full PNG only on preview/download |
+| Default generation | DPM++ 2M scheduler, **25 steps** default |
+| Network binding | Backend binds to `127.0.0.1:8000` only (local-only, not LAN) |
+| Job history retention | Keep last **500 jobs** or **90 days** (configurable in Settings) |
+| Log retention | Auto-delete log files older than **30 days** (configurable in Settings) |
 | Offline behavior | Internet only for downloading models; generation works offline afterward |
 | VRAM compatibility | Show models that fit using a safe default preset; warn/limit settings that may exceed VRAM |
 | Image size | Preset resolutions per model family; included in VRAM checks; no free-form custom size in v1 |
@@ -23,11 +35,12 @@ Plan a localhost image generator that detects NVIDIA GPU VRAM, filters compatibl
 | Storage | SQLite for prompt library and job history; JSON for settings and model catalog |
 | Prompt workflow | Bundled editable templates **plus** user saved prompt library (search, favorites, reload) |
 | Job history | All generation jobs persisted; browse, inspect, and re-run settings after restart |
+| Preflight checks | Startup dependency scan with clear missing-item messages; block Generate until critical checks pass |
 | Stack | Python FastAPI backend, React UI, Hugging Face Diffusers runtime, SQLite |
 
 ## Target Product
 
-Build a local web app with a Python FastAPI backend and React frontend. The app runs at `localhost`, uses NVIDIA CUDA first, and works offline after models are downloaded. Version 1 focuses on text-to-image generation with editable prompt templates, a saved prompt library, model selection, sequential multi-image generation for 8GB VRAM safety, and persistent job history across restarts.
+Build a **Windows-only** local web app with a Python FastAPI backend and React frontend. The app runs at **`http://127.0.0.1:8000`** on Windows 10/11, uses NVIDIA CUDA, and works offline after models are downloaded. Starting the app via the root **`start.bat`** launches the backend in the background and automatically opens the default browser once the server is ready. Version 1 focuses on text-to-image generation with editable prompt templates, a saved prompt library, model selection, sequential multi-image generation for 8GB VRAM safety, and persistent job history across restarts.
 
 ## Architecture
 
@@ -35,33 +48,48 @@ Build a local web app with a Python FastAPI backend and React frontend. The app 
 flowchart LR
   ReactUI[React UI] --> FastAPI[FastAPI Backend]
   FastAPI --> GpuProbe[GPU Probe]
+  FastAPI --> Preflight[Preflight Checks]
   FastAPI --> ModelRegistry[Model Registry]
   FastAPI --> PromptLibrary[Prompt Library]
   FastAPI --> JobHistory[Job History]
   FastAPI --> GenerationQueue[Generation Queue]
   FastAPI --> SettingsStore[Settings Store]
-  ModelRegistry --> LocalModels[Local Model Store]
   ModelRegistry --> Catalog[Curated Catalog]
+  ModelRegistry --> LocalModels[Local Model Store]
+  ModelRegistry --> ModelsDir["Models Dir APPDATA"]
   GenerationQueue --> Diffusers[Diffusers Pipeline]
+  GenerationQueue --> SSE[SSE Progress Stream]
+  Diffusers --> PipelineCache[Pipeline Cache]
   Diffusers --> OutputGallery[Generated Images]
+  OutputGallery --> ThumbCache[Thumbnail Cache]
   SettingsStore --> OutputDir[User Output Directory]
   PromptLibrary --> SQLite[(SQLite)]
   JobHistory --> SQLite
   GenerationQueue --> JobHistory
+  GpuProbe --> Preflight
+  ReactUI --> SSE
+  ReactUI --> Preflight
 ```
 
 ## Project Structure
 
+- `start.bat` — **project root** launcher: start backend in background on `127.0.0.1:8000`, wait for health, open browser, then exit
+- `stop.bat` — **project root** script: stop the background backend process
 - `backend/app/main.py` — FastAPI app and route registration
 - `backend/app/services/gpu.py` — detect CUDA availability, GPU name, total VRAM, free VRAM, driver/runtime info
+- `backend/app/services/preflight.py` — dependency and environment checks; returns pass/warn/fail with fix hints
 - `backend/app/services/models.py` — curated catalog, local import scanning, VRAM compatibility filtering
-- `backend/app/services/generation.py` — Diffusers pipeline loading, memory-safe generation, sequential image queue, image file writes, job persistence
+- `backend/app/services/generation.py` — Diffusers pipeline cache, lazy load, memory-safe generation, sequential queue, PNG + thumb writes
+- `backend/app/services/downloads.py` — model download with resume and checksum verification
+- `backend/app/services/thumbnails.py` — generate and serve 256px thumbnail cache
 - `backend/app/services/prompts.py` — bundled prompt templates and saved prompt library CRUD
-- `backend/app/services/jobs.py` — job history persistence, status updates, re-run helpers
+- `backend/app/services/jobs.py` — job history persistence, retention, status updates, re-run helpers, SSE events
 - `backend/app/services/settings.py` — load/save persistent user settings, validate output directory
+- `backend/app/services/logging_config.py` — file logging setup and log retention pruning
+- `backend/app/api/sse.py` — SSE endpoint for job progress streams
 - `backend/app/db/database.py` — SQLite connection, migrations, schema init
 - `backend/app/db/schema.sql` — tables for saved prompts, jobs, and job images
-- `backend/app/data/models.catalog.json` — curated SD 1.5 and selected SDXL model metadata
+- `backend/app/data/models.catalog.json` — curated catalog (2–3 SD 1.5 + 1 SDXL initially)
 - `backend/app/data/prompt_templates.json` — bundled starter templates (read-only)
 - `config/settings.json` — persisted user settings (created on first run; gitignored)
 - `data/app.db` — SQLite database for prompt library and job history (gitignored)
@@ -70,19 +98,24 @@ flowchart LR
 - `frontend/src/features/generate` — prompt editor, settings panel, queue progress, and gallery
 - `frontend/src/features/prompts` — saved prompt library browser, search, favorites
 - `frontend/src/features/history` — job history list, job detail, re-run settings
-- `frontend/src/features/settings` — output directory picker and persisted preferences UI
+- `frontend/src/features/settings` — output directory, history retention, and **System status** (preflight results)
+- `frontend/src/features/setup` — first-run setup banner when critical preflight checks fail
 
 ## Core Decisions
 
-Use Hugging Face Diffusers as the first generation runtime. This keeps the app under our control, avoids depending on another web UI, and gives direct access to memory options like `torch_dtype=torch.float16`, attention slicing, model CPU offload, VAE tiling, and pipeline unloading.
+Use Hugging Face Diffusers as the first generation runtime. This keeps the app under our control, avoids depending on another web UI, and gives direct access to memory options like `torch_dtype=torch.float16`, attention slicing, and VAE tiling.
+
+**Do not load a Diffusers pipeline on app startup.** Detect GPU, load settings, and init SQLite first so the UI appears quickly. Load the pipeline lazily on the first generate request (or when the user selects a model to preload), then **keep it cached in memory until the selected model changes** to avoid repeated 10–30s reloads.
 
 Detect NVIDIA VRAM at startup using PyTorch CUDA APIs, with `nvidia-smi` as a diagnostic fallback. Store both total VRAM and current free VRAM, but filter the model list primarily by total VRAM with a conservative reserved headroom. This avoids hiding models just because another process is temporarily using the GPU, while still warning if free VRAM is currently too low.
+
+All downloaded and imported models live under **`%APPDATA%/OnPremImageGenerator/models`**. Download a model only when the user selects it from the catalog (lazy download). Support **resume and checksum verification** for large model files.
 
 Model compatibility should be based on model plus safe preset. Each catalog entry should include fields such as `family`, `min_vram_gb`, `recommended_vram_gb`, `default_width`, `default_height`, `default_steps`, `precision`, and `requires_license_acceptance`. Imported local models can be shown as "unknown compatibility" until the user assigns a family or the app infers metadata from the model structure.
 
 Image size is part of the safe preset, not a separate free-form setting in v1. See [Image Size / Resolution](#image-size--resolution) below.
 
-Generate multiple requested images sequentially through a queue. The UI can still treat this as one request, but the backend should run one image at a time, update progress after each image, clear unused CUDA memory between jobs when needed, and keep 8GB GPUs stable. Each job is written to SQLite so history survives app restarts. See [Storage & Database](#storage--database), [Saved Prompt Library](#saved-prompt-library), and [Job History](#job-history).
+Generate multiple requested images sequentially through a queue. Use a **seed stream** for multi-image jobs: base seed for image 1, then `seed + 1`, `seed + 2`, etc. Call `torch.cuda.empty_cache()` between images **only when needed** (after OOM or when switching models), not unconditionally. Push progress to the UI via **SSE** (`image_completed`, `progress`, `failed`). Each job is written to SQLite so history survives app restarts. Re-validate [preflight checks](#dependency--preflight-checks) before enqueueing a job. See [Storage & Database](#storage--database), [Saved Prompt Library](#saved-prompt-library), [Job History](#job-history), and [Runtime & Performance](#runtime--performance).
 
 ## Version 1 UX
 
@@ -90,9 +123,11 @@ The model picker shows only compatible curated models by default. A secondary "I
 
 The prompt flow should start from bundled editable templates **or** a saved entry from the user's prompt library. A user chooses a starting point, edits the final prompt and optional negative prompt, then chooses image count, dimensions from safe presets, steps, and seed behavior. They can save the current prompt to the library at any time before generating. Generated images are saved to the user's configured output directory, recorded in job history, and shown in the in-app gallery.
 
-The generation screen should show queue progress, per-image status, generated thumbnails (as each image completes), seed/model/settings metadata, and error messages for out-of-memory failures with a suggested lower-memory preset. Clicking a thumbnail opens a full-size preview; each image can be downloaded or opened in the file manager.
+The generation screen should show queue progress via **SSE** (live updates as each image completes), per-image status, cached **256px thumbnails**, seed/model/settings metadata, and error messages for out-of-memory failures with a suggested lower-memory preset. Clicking a thumbnail opens a full-size preview; each image can be downloaded or opened in the file manager.
 
 A **History** page lists past generation jobs (newest first) with status, thumbnail strip, and a **Use again** action that prefills the generate form with that job's settings.
+
+On first launch (and available anytime under **Settings → System status**), the app runs **preflight checks** and shows what is OK, missing, or needs attention — with plain-language fix hints. **Generate** is disabled until all **critical** checks pass.
 
 ## Image Size / Resolution
 
@@ -181,12 +216,11 @@ Users can choose where generated images are saved. The setting is **persistent**
 
 ### Default output directory
 
-On first run, if no setting exists, create and use a platform-specific default:
+On first run, if no setting exists, create and use the Windows default:
 
-| Platform | Default path |
-|----------|--------------|
-| Windows | `%USERPROFILE%/OnPremImageGenerator/outputs` |
-| Linux | `~/OnPremImageGenerator/outputs` |
+| Default path |
+|--------------|
+| `%USERPROFILE%/OnPremImageGenerator/outputs` |
 
 The backend creates the default directory if it does not exist.
 
@@ -212,7 +246,10 @@ Example:
   "output_directory": "D:/MyImages/ai-generated",
   "last_model_id": "sd15-realistic-vision",
   "last_size_preset_id": "512x512",
-  "last_steps": 25
+  "last_steps": 25,
+  "history_retention_days": 90,
+  "history_retention_max_jobs": 500,
+  "log_retention_days": 30
 }
 ```
 
@@ -241,29 +278,34 @@ Return clear errors to the UI (e.g. "Cannot write to this folder") rather than f
 Each generated image is written to the configured output directory using a predictable naming scheme:
 
 ```
-{output_directory}/{YYYYMMDD}/{job_id}_{index}_{seed}.png
+{output_directory}/{YYYYMMDD}/{job_id}/
+  {job_id}_1_{seed}.png
+  {job_id}_2_{seed}.png
+  job.json
 ```
 
-Also write a sidecar metadata file alongside each image (or one JSON per job) containing prompt, negative prompt, model, size preset, steps, and seed — so outputs remain useful outside the app.
+Write **one `job.json` per job folder** containing prompt, negative prompt, model, size preset, steps, seeds, and per-image file names — portable metadata without duplicating JSON per image.
 
 Example:
 
 ```
 D:/MyImages/ai-generated/
   20260629/
-    job_a1b2c3_1_4281579362.png
-    job_a1b2c3_1_4281579362.json
-    job_a1b2c3_2_9182736451.png
-    job_a1b2c3_2_9182736451.json
+    job_a1b2c3/
+      job_a1b2c3_1_4281579362.png
+      job_a1b2c3_2_9182736451.png
+      job.json
 ```
+
+Thumbnails are stored separately under `%APPDATA%/OnPremImageGenerator/thumbs/{job_id}/` and referenced from `job_images.thumb_path` in SQLite.
 
 ### Gallery integration
 
-The in-app gallery reads from job history (primary) and the output directory (fallback for orphaned files):
+The in-app gallery reads from job history (primary) and serves **cached 256px thumbnails** — not full PNGs — for list and History views. Full-resolution images load only on preview or download.
 
-- Thumbnails appear in the UI as each image completes
-- Each completed image is linked to its job record and file path
-- Gallery entries reference the saved file path so **Open folder** and **Download** work after restart
+- Thumbnails appear in the UI as each image completes (via SSE)
+- Each completed image is linked to its job record, file path, and thumb path
+- Gallery entries reference saved paths so **Open folder** and **Download** work after restart
 - On app load, show recent images from job history (e.g. last 50 completed images across all jobs)
 - If a file on disk is missing, show a placeholder and mark the job image record as `file_missing`
 
@@ -278,7 +320,7 @@ The in-app gallery reads from job history (primary) and the output directory (fa
 
 ### UI placement (settings)
 
-- **Settings page** — primary place to change output directory
+- **Settings page** — output directory, history retention, log retention, **System status** (preflight checklist + re-run)
 - **Generate page** — read-only display of current output path with a link to Settings
 - Do not require users to re-select the folder each session
 
@@ -429,10 +471,11 @@ Each output image gets a `job_images` row:
 | `index` | 1-based image index within the job |
 | `seed` | Seed used for this image |
 | `file_path` | Absolute path to PNG on disk |
+| `thumb_path` | Absolute path to 256px cached thumbnail |
 | `status` | `completed`, `failed`, or `file_missing` |
 | `created_at` | When the image was written |
 
-Sidecar JSON files on disk remain the portable export format; SQLite is the index for fast UI queries.
+`job.json` files on disk remain the portable export format; SQLite is the index for fast UI queries.
 
 ### UI behavior
 
@@ -447,12 +490,12 @@ Sidecar JSON files on disk remain the portable export format; SQLite is the inde
 
 **Generate page** (active job):
 
-- Show live progress against the persisted job record (not only in-memory state)
-- If the user refreshes the browser mid-job, reconnect to the running job via `GET /api/jobs/{id}`
+- Show live progress via **SSE** against the persisted job record (not polling)
+- If the user refreshes the browser mid-job, reconnect to SSE stream and fetch job state via `GET /api/jobs/{id}`
 
 **Startup**:
 
-- Load recent jobs into History
+- Load recent jobs into History; apply **retention policy** (delete jobs older than 90 days or beyond the 500-job cap, including orphaned thumbs)
 - Mark stale `running`/`queued` jobs as `interrupted`
 - Gallery pulls recent completed images from `job_images`
 
@@ -466,6 +509,7 @@ Sidecar JSON files on disk remain the portable export format; SQLite is the inde
 | POST | `/api/jobs/{id}/cancel` | Cancel a running or queued job |
 | DELETE | `/api/jobs/{id}` | Delete job record (optional `?delete_files=true`) |
 | GET | `/api/jobs/recent-images` | Recent completed images for gallery strip |
+| GET | `/api/jobs/{id}/events` | SSE stream for job progress (`progress`, `image_completed`, `failed`, `done`) |
 
 ### SQLite schema (jobs)
 
@@ -498,11 +542,244 @@ CREATE TABLE job_images (
   idx INTEGER NOT NULL,
   seed INTEGER NOT NULL,
   file_path TEXT NOT NULL,
+  thumb_path TEXT,
   status TEXT NOT NULL DEFAULT 'completed',
   created_at TEXT NOT NULL
 );
 CREATE INDEX idx_job_images_job_id ON job_images(job_id);
 ```
+
+## Runtime & Performance
+
+Optimizations applied in v1 to keep the app responsive on Windows with 8GB GPUs.
+
+### Fast startup
+
+1. Bind FastAPI to **`127.0.0.1:8000`** only — not `0.0.0.0` — so the app is local-only.
+2. On startup: GPU detect → settings load → SQLite init → **preflight checks** → serve UI. **No Diffusers import or pipeline load.**
+3. User double-clicks root **`start.bat`** — see [App Launch & Browser Auto-Open](#app-launch--browser-auto-open).
+
+### App Launch & Browser Auto-Open
+
+Users start the app by double-clicking **`start.bat`** in the **project root**. The launcher starts the backend **in the background**, waits until it is ready, opens the default browser, then **exits** (no lingering command window).
+
+| Setting | Value |
+|---------|-------|
+| Host | `127.0.0.1` |
+| Port | **8000** (fixed in v1) |
+| App URL | **`http://127.0.0.1:8000`** |
+| Health endpoint | `GET http://127.0.0.1:8000/api/health` |
+
+### `start.bat` flow
+
+```mermaid
+sequenceDiagram
+  participant User
+  participant StartBat as start.bat
+  participant Backend as FastAPI_8000_Background
+  participant Browser
+
+  User->>StartBat: Double-click root start.bat
+  StartBat->>Backend: Start uvicorn detached or hidden
+  StartBat->>StartBat: Write PID file
+  loop Poll until ready
+    StartBat->>Backend: GET /api/health
+    Backend-->>StartBat: 200 OK
+  end
+  StartBat->>Browser: start http://127.0.0.1:8000
+  StartBat->>StartBat: Exit launcher
+  Browser->>Backend: Load UI
+```
+
+1. If backend is **already running** (health check passes): skip start, open browser only, then exit.
+2. Start the FastAPI backend on `127.0.0.1:8000` **in the background** — no visible console window for normal users. Use a detached/hidden process (e.g. `pythonw.exe` or `start /B` with log file). Write the process id to `%APPDATA%/OnPremImageGenerator/app.pid`.
+3. Poll `GET /api/health` every **500 ms** until it returns **200** or **30 s** timeout.
+4. On success: run `start http://127.0.0.1:8000` to open the **default Windows browser**, then **exit** the `.bat` script.
+5. On timeout: show a brief error dialog or message (“Backend did not start”) and exit; do **not** open the browser.
+6. If port **8000** is in use but health check fails: show error (“Port 8000 is in use — run `stop.bat` or close the other instance”) and exit.
+
+Backend logs go to `%APPDATA%/OnPremImageGenerator/logs/` (e.g. `app.log` with daily rotation). Log files older than **30 days** are **auto-deleted** on startup and periodically — see [Log retention](#log-retention).
+
+### Stop the app
+
+- Double-click root **`stop.bat`** to read `app.pid`, terminate the backend process, and remove the pid file.
+- Document in README: use `stop.bat` before restarting if the app misbehaves.
+
+### Serving the UI on port 8000
+
+- **Production / packaged run:** FastAPI on port 8000 serves both the **REST/SSE API** and the **built React static files** from the same origin.
+- **Development:** optional split (Vite dev server + API proxy) for local coding only; `start.bat` targets the unified **`127.0.0.1:8000`** experience users get in release.
+
+### User experience
+
+- **Primary entry point:** double-click root **`start.bat`** → backend runs in background → browser opens → launcher closes.
+- **Manual access:** user can bookmark or open `http://127.0.0.1:8000` anytime while the backend is running.
+- **Stop the app:** double-click root **`stop.bat`** (backend keeps running until stopped).
+- **Already running:** double-clicking `start.bat` again opens the browser without starting a second backend instance.
+- **Already open in browser:** `start` may open a new tab/window (acceptable for v1).
+
+### Configuration
+
+- Port **8000** is hardcoded in v1 (backend config constant + root `start.bat`). Configurable port is out of scope until a later version.
+- Document the URL and start/stop steps in a short `README`.
+
+### Pipeline cache
+
+- Load pipeline **lazily** on first generate (show "Loading model…" in UI).
+- Keep the loaded pipeline in memory while the same model remains selected.
+- **Reload only when `model_id` changes**; unload previous pipeline before loading the next.
+- For SDXL, enable at load time: **fp16**, **attention slicing**, **VAE tiling**.
+
+### Generation defaults
+
+| Setting | Default | Notes |
+|---------|---------|-------|
+| Scheduler | DPM++ 2M | Good quality/speed balance |
+| Steps | 25 | Exposed in UI; user can adjust |
+| Multi-image seeds | `seed`, `seed+1`, `seed+2`, … | Predictable batch variation |
+
+### Model downloads
+
+- Store all models under `%APPDATA%/OnPremImageGenerator/models/`.
+- **Lazy download**: fetch only when user selects a catalog model that is not yet local.
+- Support **resume** on interrupted downloads and **checksum verification** after complete.
+
+### Thumbnails
+
+- On each saved PNG, generate a **256px** thumbnail (Pillow) immediately after generation.
+- Store under `%APPDATA%/OnPremImageGenerator/thumbs/{job_id}/`.
+- Gallery and History list views serve thumbs; full PNG only for preview/download.
+
+### Job history retention
+
+Prevent unbounded DB and thumb cache growth:
+
+- Default: keep jobs from the last **90 days** and cap at **500 jobs** (whichever stricter rule applies first).
+- Configurable via `history_retention_days` and `history_retention_max_jobs` in settings.
+- On startup and after each job completion, prune expired jobs and delete orphaned thumbnail files.
+- Pruning removes SQLite rows only; offer separate user action to delete image files on disk
+
+### Log retention
+
+Prevent unbounded log growth on disk:
+
+- Log directory: `%APPDATA%/OnPremImageGenerator/logs/`
+- Default retention: **30 days** — auto-delete any log file whose last-modified date is older than 30 days
+- Configurable via `log_retention_days` in `config/settings.json` (Settings page)
+- Run pruning **on backend startup** and **once per day** while the app is running (lightweight background task)
+- Applies to rotated log files (e.g. `app.log`, `app.log.2026-06-01`); delete expired files only — do not truncate the active log file currently in use
+- Log retention is independent of job history retention (jobs: 90 days; logs: 30 days)
+
+## Dependency & Preflight Checks
+
+On startup and on demand, the app scans the local environment and reports anything missing or misconfigured **before** the user hits Generate.
+
+### Goals
+
+- Tell the user clearly what is installed and what is not
+- Block generation when critical dependencies are missing
+- Show warnings (not blockers) for non-critical issues such as low disk space or VRAM below 8 GB
+- Provide actionable **fix hints** for each failed check
+
+### When checks run
+
+| Trigger | Behavior |
+|---------|----------|
+| App startup | Run full preflight after GPU detect + settings + SQLite init |
+| First launch | Show **Setup** banner if any critical check fails |
+| Settings → System status | Show full checklist; **Re-run checks** button |
+| Before Generate | Re-validate critical checks; reject with error if any fail |
+| Model select | Informational check: model downloaded locally (not a global blocker) |
+
+### Check catalog
+
+Each check returns: `id`, `name`, `status` (`pass` \| `warn` \| `fail`), `message`, `fix_hint`, `severity` (`critical` \| `warning` \| `info`).
+
+| ID | Check | Severity | Pass | Fail / warn |
+|----|-------|----------|------|-------------|
+| `nvidia_gpu` | NVIDIA GPU present | **critical** | GPU detected via CUDA or `nvidia-smi` | No NVIDIA GPU found |
+| `cuda_available` | CUDA available to PyTorch | **critical** | `torch.cuda.is_available()` is true | CUDA not available — driver or PyTorch CUDA build issue |
+| `nvidia_driver` | NVIDIA driver readable | **critical** | `nvidia-smi` returns driver version | Driver not installed or not on PATH |
+| `vram_total` | GPU VRAM | warning | ≥ 8 GB total VRAM | < 8 GB — show warning; restrict SDXL/large presets |
+| `vram_free` | Free VRAM now | warning | Enough free for default preset | Low free VRAM — warn user to close other GPU apps |
+| `app_data_writable` | App data directory | **critical** | `%APPDATA%/OnPremImageGenerator` exists and is writable | Cannot create or write app data folder |
+| `output_dir_writable` | Output directory | **critical** | Configured output path is writable | Missing, not creatable, or read-only |
+| `models_dir_writable` | Models directory | **critical** | `%APPDATA%/.../models` writable | Cannot store downloaded models |
+| `disk_space_models` | Disk space for models | warning | ≥ 10 GB free on models drive | Low disk — may fail model download |
+| `disk_space_output` | Disk space for output | warning | ≥ 1 GB free on output drive | Low disk — generation may fail |
+| `sqlite_ok` | Local database | **critical** | `data/app.db` opens and schema valid | DB init or migration failed |
+| `pytorch_ok` | PyTorch import | **critical** | `import torch` succeeds | Backend runtime broken |
+| `diffusers_ok` | Diffusers import | **critical** | `import diffusers` succeeds | Generation library missing |
+
+**Not** included as global startup blockers (handled elsewhere):
+
+- **Model not downloaded** — shown on model picker as “Download required”, not a preflight fail
+- **Selected model incompatible with VRAM** — handled by model/size preset filtering
+
+### API
+
+| Method | Endpoint | Purpose |
+|--------|----------|---------|
+| GET | `/api/system/preflight` | Run all checks; return summary + item list |
+| GET | `/api/system/preflight/status` | Return last cached result without re-running (fast UI load) |
+| POST | `/api/system/preflight/rerun` | Force re-run all checks |
+
+Example response:
+
+```json
+{
+  "ready": false,
+  "critical_passed": false,
+  "warning_count": 1,
+  "checked_at": "2026-06-29T12:00:00Z",
+  "items": [
+    {
+      "id": "cuda_available",
+      "name": "CUDA available",
+      "status": "fail",
+      "severity": "critical",
+      "message": "PyTorch cannot access CUDA.",
+      "fix_hint": "Install the latest NVIDIA driver for your GPU, then restart the app. Ensure the app was installed with the CUDA-enabled PyTorch build."
+    },
+    {
+      "id": "vram_total",
+      "name": "GPU memory",
+      "status": "pass",
+      "severity": "warning",
+      "message": "8192 MB total VRAM detected.",
+      "fix_hint": null
+    }
+  ]
+}
+```
+
+### UI behavior
+
+**First-run / Setup banner** (shown when `critical_passed` is false):
+
+- Headline: “Setup required before you can generate images”
+- List failed critical checks with `message` + `fix_hint`
+- Link to **Settings → System status**
+- **Generate** button disabled app-wide
+
+**Settings → System status**:
+
+- Full checklist with pass / warn / fail indicators
+- GPU name, driver version, total/free VRAM summary
+- **Re-run checks** button
+- Warnings visible but do not block Generate if all critical checks pass
+
+**Generate page**:
+
+- If preflight is stale (>5 min) or output dir changed, re-run critical checks silently before enqueue
+- On fail: inline error with fix hint; do not create job
+
+### Implementation notes
+
+- Implement checks in `backend/app/services/preflight.py`; reuse `gpu.py` and `settings.py` helpers
+- Cache last result in memory with timestamp; refresh on startup and on explicit rerun
+- Keep check functions small and independently testable (one function per check id)
+- Log all check results at INFO for support diagnostics
 
 ## 8GB VRAM Strategy
 
@@ -510,50 +787,72 @@ Prioritize SD 1.5 models as the reliable baseline. Include SDXL only with conser
 
 Use safeguards in generation:
 
-- Load only the selected model pipeline, not every available model
-- Use fp16 on CUDA
+- Lazy-load and cache only the selected model pipeline; reload when model changes
+- Use fp16 on CUDA; enable attention slicing and VAE tiling for SDXL at load time
 - Limit dimensions to curated size presets per model family (see Image Size / Resolution)
 - Filter visible presets by detected VRAM before generation
 - Generate images sequentially even when the user requests multiple outputs
-- Unload or swap pipelines when the selected model changes
+- Use seed stream (`seed + n`) for multi-image jobs
+- Call `torch.cuda.empty_cache()` only when needed (OOM recovery or model swap)
 - Catch CUDA out-of-memory errors, release memory, and return actionable UI guidance
 
 ## Implementation Phases
 
-1. Scaffold backend and frontend, add health check, GPU detection endpoint, SQLite init, and basic React shell
-2. Add model catalog, size presets, and compatibility filtering based on detected VRAM
-3. Add local model import scanning and metadata assignment
-4. Add bundled prompt templates, saved prompt library (CRUD, search, favorites), and Settings page
-5. Add Diffusers text-to-image generation for one image; save to output directory; persist job + job_images records
-6. Add sequential multi-image queue, progress updates, cancellation, in-app gallery, metadata sidecars, and History page
-7. Add SDXL-safe presets, out-of-memory handling, interrupted-job recovery on startup, and verification on an 8GB NVIDIA GPU
+Build in this order to validate the hardest path early and reduce rework:
+
+1. Scaffold backend and frontend; bind to `127.0.0.1:8000`; `/api/health`; GPU detection; **preflight checks**; SQLite init; root **`start.bat`** (background) + **`stop.bat`**; basic React shell + Setup banner
+2. Settings page (output directory, System status), preflight UI, and model catalog with size presets + VRAM filtering (2–3 SD 1.5 + 1 SDXL)
+3. **One SD 1.5 model**: lazy pipeline load, generate one image, save PNG + `job.json`, SSE progress, 256px thumbs
+4. Sequential multi-image queue, job history persistence, in-app gallery, cancellation, interrupted-job recovery
+5. Bundled prompt templates, saved prompt library (CRUD, search, favorites), and History page with re-run
+6. Model lazy download (resume + checksum), local model import scanning, SDXL with memory opts + OOM handling
+7. Job history retention pruning; log retention pruning (30 days); full verification on Windows 10/11 with 8GB NVIDIA GPU
 
 ## Build Checklist
 
-- [ ] Create the FastAPI backend, React frontend, SQLite setup, and local development scripts
+- [ ] Create FastAPI + React scaffold; bind `127.0.0.1:8000`; `/api/health`; SQLite init; root **`start.bat`** (background + browser) and **`stop.bat`**
+- [ ] Implement preflight service, `/api/system/preflight`, Setup banner, and Settings → System status UI
 - [ ] Implement CUDA GPU detection and expose VRAM/runtime information to the UI
-- [ ] Build the curated model catalog, size presets, local import scanner, and VRAM compatibility filter
-- [ ] Implement bundled templates, saved prompt library (CRUD, search, favorites), and generation settings UI
-- [ ] Add persistent settings service, output directory picker, and validation
-- [ ] Add Diffusers text-to-image generation; write PNG + sidecar metadata; persist jobs and job_images
-- [ ] Add sequential multi-image queue, progress reporting, cancellation, in-app gallery, and History page with re-run
-- [ ] Handle interrupted jobs on startup; verify job history and prompt library survive app restart
-- [ ] Test the full flow on an 8GB NVIDIA GPU and tune safe presets
+- [ ] Build curated catalog (2–3 SD 1.5 + 1 SDXL), size presets, local import scanner, VRAM filter
+- [ ] Add Settings, output directory validation, lazy model download with resume + checksum
+- [ ] Implement lazy pipeline cache, one SD 1.5 image generation, PNG + `job.json`, 256px thumbs
+- [ ] Add SSE job progress stream; sequential multi-image queue; cancellation; in-app gallery
+- [ ] Implement job history, History page with re-run, retention pruning (90 days / 500 jobs)
+- [ ] Implement log retention: auto-delete log files older than 30 days on startup and daily
+- [ ] Implement bundled templates and saved prompt library (CRUD, search, favorites)
+- [ ] Add SDXL memory opts (fp16, attention slicing, VAE tiling) and OOM recovery
+- [ ] Handle interrupted jobs on startup; verify persistence across restart
+- [ ] Test full flow on Windows 10/11 with 8GB NVIDIA GPU
 
 ## Validation Plan
 
-Test on an NVIDIA CUDA machine with 8GB VRAM. Verify:
+Test on **Windows 10/11** with an NVIDIA CUDA GPU (8GB VRAM). Verify:
 
 - GPU detection
+- Preflight checks report missing CUDA, driver, GPU, or writable paths with fix hints
+- Generate blocked when critical preflight checks fail; warnings shown for low VRAM/disk
+- Settings → System status re-runs checks on demand
 - Compatible model filtering (model + size preset)
 - Size preset picker shows only VRAM-safe options; unsupported sizes are disabled
 - OOM recovery suggests the next smaller preset
 - SD 1.5 generation
 - Selected SDXL generation with safe presets
-- Sequential multi-image generation; thumbnails appear as each image completes
+- App starts quickly without loading Diffusers pipeline on startup
+- Pipeline cache: no reload when generating again with the same model
+- SSE delivers live progress; thumbnails appear as each image completes
+- Cached 256px thumbs used in gallery/History; full PNG on preview only
+- One `job.json` per job folder; images under `{output}/{date}/{job_id}/`
+- Models stored under `%APPDATA%/OnPremImageGenerator/models`; lazy download with resume
+- Backend bound to `127.0.0.1:8000` only
+- Root `start.bat` starts backend in background, opens `http://127.0.0.1:8000`, then exits; no lingering cmd window
+- Root `stop.bat` stops the background backend via pid file
+- Double-clicking `start.bat` when already running only opens the browser
+- Job retention prunes jobs beyond 90 days or 500-job cap
+- Log files older than 30 days are auto-deleted; `log_retention_days` configurable in Settings
+- Default scheduler DPM++ 2M at 25 steps; multi-image seed stream
 - Custom output directory can be set in Settings and persists across app restarts
 - Invalid or unwritable output paths are rejected with clear UI errors
-- Generated files appear on disk under the configured directory with metadata sidecars
+- Generated files appear on disk under `{job_id}/` folders with `job.json` metadata
 - Gallery shows recent images from job history after restart
 - Saved prompt library: create, search, favorite, load, edit, delete; survives restart
 - Job history: all jobs persisted with status, settings, and image paths; survives restart

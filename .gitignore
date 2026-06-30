@@ -1,0 +1,10 @@
+node_modules/
+frontend/dist/
+config/settings.json
+data/
+*.pyc
+__pycache__/
+.venv/
+venv/
+*.log
+.DS_Store

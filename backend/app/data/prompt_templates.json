@@ -1,0 +1,30 @@
+[
+  {
+    "id": "portrait-photo",
+    "name": "Portrait photo",
+    "description": "Realistic portrait starter",
+    "prompt": "professional portrait photo of a person, soft natural lighting, shallow depth of field, 85mm lens, detailed skin texture",
+    "negative_prompt": "cartoon, illustration, blurry, low quality, deformed"
+  },
+  {
+    "id": "landscape",
+    "name": "Landscape",
+    "description": "Outdoor scenic starter",
+    "prompt": "breathtaking landscape, golden hour, dramatic clouds, ultra detailed, cinematic composition",
+    "negative_prompt": "people, text, watermark, low quality, oversaturated"
+  },
+  {
+    "id": "product-shot",
+    "name": "Product shot",
+    "description": "Clean product photography starter",
+    "prompt": "studio product photo on white background, soft shadows, commercial photography, sharp focus",
+    "negative_prompt": "cluttered background, blurry, low quality, distorted"
+  },
+  {
+    "id": "fantasy-character",
+    "name": "Fantasy character",
+    "description": "Character concept art starter",
+    "prompt": "fantasy character concept art, detailed armor, dynamic pose, painterly style, dramatic lighting",
+    "negative_prompt": "photorealistic, blurry, low quality, extra limbs"
+  }
+]

@@ -1,7 +1,7 @@
 node_modules/
 frontend/dist/
+/data/
 config/settings.json
-data/
 *.pyc
 __pycache__/
 .venv/

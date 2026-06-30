@@ -11,9 +11,11 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from db import init_database
+from db.repositories.jobs import mark_interrupted_jobs
+
 from .api.sse import router as sse_router
 from .config import FRONTEND_DIST, HOST, PORT, ensure_directories
-from .db.database import init_database, mark_interrupted_jobs
 from .services.downloads import download_catalog_model
 from .services.logging_config import prune_old_logs, setup_logging
 from .services.jobs import (

@@ -3,12 +3,10 @@ from __future__ import annotations
 import sqlite3
 import threading
 from contextlib import contextmanager
-from pathlib import Path
 from typing import Any, Iterator
 
-from ..config import DB_PATH, SCHEMA_PATH, ensure_directories
+from .config import DB_PATH, SCHEMA_PATH, SCHEMA_VERSION, ensure_data_dir
 
-SCHEMA_VERSION = 1
 _local = threading.local()
 
 
@@ -22,7 +20,7 @@ def _configure_connection(conn: sqlite3.Connection) -> None:
 def get_connection() -> sqlite3.Connection:
     conn = getattr(_local, "connection", None)
     if conn is None:
-        ensure_directories()
+        ensure_data_dir()
         conn = sqlite3.connect(DB_PATH, check_same_thread=False)
         _configure_connection(conn)
         _local.connection = conn
@@ -44,13 +42,16 @@ def db_cursor() -> Iterator[sqlite3.Cursor]:
 
 
 def init_database() -> None:
-    ensure_directories()
+    ensure_data_dir()
     schema_sql = SCHEMA_PATH.read_text(encoding="utf-8")
     with db_cursor() as cur:
         cur.executescript(schema_sql)
         row = cur.execute("SELECT version FROM schema_version LIMIT 1").fetchone()
         if row is None:
-            cur.execute("INSERT INTO schema_version(version) VALUES (?)", (SCHEMA_VERSION,))
+            cur.execute(
+                "INSERT INTO schema_version(version) VALUES (?)",
+                (SCHEMA_VERSION,),
+            )
         elif row["version"] < SCHEMA_VERSION:
             cur.execute(
                 "UPDATE schema_version SET version = ?",
@@ -71,15 +72,3 @@ def fetch_one(query: str, params: tuple[Any, ...] = ()) -> sqlite3.Row | None:
 def execute(query: str, params: tuple[Any, ...] = ()) -> None:
     with db_cursor() as cur:
         cur.execute(query, params)
-
-
-def mark_interrupted_jobs() -> int:
-    with db_cursor() as cur:
-        cur.execute(
-            """
-            UPDATE jobs
-            SET status = 'interrupted', finished_at = COALESCE(finished_at, datetime('now'))
-            WHERE status IN ('running', 'queued')
-            """
-        )
-        return cur.rowcount

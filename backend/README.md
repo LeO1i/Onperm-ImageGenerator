@@ -23,6 +23,15 @@ On Windows with NVIDIA GPU, install PyTorch with CUDA from https://pytorch.org b
 
 ```bash
 cd backend
+# From project root, PYTHONPATH must include the repo root for the db package:
+PYTHONPATH=.. uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
+```
+
+On Windows (cmd):
+
+```bat
+set PYTHONPATH=..
+cd backend
 uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
 ```
 
@@ -61,7 +70,7 @@ Key routes:
 | Data | Path |
 |------|------|
 | Settings | `config/settings.json` |
-| SQLite DB | `data/app.db` |
+| SQLite DB | `data/app.db` (managed by `db/` package) |
 | Models | `%APPDATA%/OnPremImageGenerator/models` |
 | Thumbnails | `%APPDATA%/OnPremImageGenerator/thumbs` |
 | Logs | `%APPDATA%/OnPremImageGenerator/logs` |

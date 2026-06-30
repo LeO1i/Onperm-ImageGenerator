@@ -7,6 +7,7 @@ set "URL=http://%HOST%:%PORT%"
 set "HEALTH=%URL%/api/health"
 set "ROOT=%~dp0"
 set "BACKEND=%ROOT%backend"
+set "PYTHONPATH=%ROOT%"
 
 if not defined APPDATA set "APPDATA=%USERPROFILE%\AppData\Roaming"
 set "PID_FILE=%APPDATA%\OnPremImageGenerator\app.pid"
@@ -23,7 +24,7 @@ if not errorlevel 1 (
 )
 
 pushd "%BACKEND%"
-start "" /B pythonw -m uvicorn app.main:app --host %HOST% --port %PORT% >nul 2>&1
+start "" /B pythonw -m uvicorn app.main:app --host %HOST% --port %PORT% --app-dir "%BACKEND%" >nul 2>&1
 popd
 
 set /a ATTEMPTS=0

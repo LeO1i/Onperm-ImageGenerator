@@ -251,7 +251,7 @@ def run_preflight_checks(force: bool = False) -> dict[str, Any]:
 
     sqlite_ok = False
     try:
-        from ..db.database import init_database
+        from db import init_database
 
         init_database()
         sqlite_ok = DATA_DIR.joinpath("app.db").exists()

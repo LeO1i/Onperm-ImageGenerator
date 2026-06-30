@@ -1,0 +1,2 @@
+-- Placeholder for future incremental migrations.
+-- Bump SCHEMA_VERSION in db/config.py when adding scripts here.

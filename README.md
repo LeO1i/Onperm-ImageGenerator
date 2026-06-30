@@ -25,7 +25,8 @@ The app opens at **http://127.0.0.1:8000**. Use **`stop.bat`** to shut down the 
 
 ## Project layout
 
-- `backend/` — FastAPI API, SQLite, Diffusers generation worker
+- `backend/` — FastAPI API, Diffusers generation worker
+- `db/` — **Standalone SQLite package** (schema, connection, repositories)
 - `frontend/` — React UI
 - `config/settings.json` — user settings (created on first run)
 - `data/app.db` — prompt library and job history
@@ -36,8 +37,8 @@ The app opens at **http://127.0.0.1:8000**. Use **`stop.bat`** to shut down the 
 Run backend and frontend separately:
 
 ```bash
-# Terminal 1
-cd backend && uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
+# Terminal 1 (from project root)
+PYTHONPATH=. uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload --app-dir backend
 
 # Terminal 2
 cd frontend && npm run dev

@@ -21,7 +21,6 @@ CONFIG_DIR = PROJECT_ROOT / "config"
 FRONTEND_DIST = PROJECT_ROOT / "frontend" / "dist"
 CATALOG_PATH = PACKAGE_ROOT / "data" / "models.catalog.json"
 TEMPLATES_PATH = PACKAGE_ROOT / "data" / "prompt_templates.json"
-SCHEMA_PATH = PACKAGE_ROOT / "db" / "schema.sql"
 
 
 def _user_home() -> Path:
@@ -46,7 +45,6 @@ LOGS_DIR = APP_DATA_ROOT / "logs"
 PID_FILE = APP_DATA_ROOT / "app.pid"
 LOCAL_MODELS_CACHE = APP_DATA_ROOT / "local_models_cache.json"
 SETTINGS_PATH = CONFIG_DIR / "settings.json"
-DB_PATH = DATA_DIR / "app.db"
 
 
 def default_output_directory() -> Path:
